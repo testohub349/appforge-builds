@@ -96,22 +96,24 @@ jobs:
         working-directory: work
         run: |
           mkdir -p project
-          # Use expect to accept all default answers to the interactive walkthrough
           sudo apt-get install -y expect >/dev/null 2>&1 || true
-          expect << EOF
+          # Write expect script to a file to avoid heredoc/tcl escaping issues
+          cat > init.exp <<'EXP_EOF'
+          #!/usr/bin/expect -f
           set timeout 600
-          spawn bubblewrap init --manifest=$MANIFEST_URL --directory=./project --skipPwaValidation
+          set url [lindex $argv 0]
+          set pass [lindex $argv 1]
+          spawn bubblewrap init --manifest=$url --directory=./project --skipPwaValidation
           expect {
-            -re "\\\(Y/n\\\)" { send "y\r"; exp_continue }
-            -re "\\\(y/N\\\)" { send "\r"; exp_continue }
-            -re "\\\[Y/n\\\]" { send "y\r"; exp_continue }
-            -re "Password.*:" { send "$KEYSTORE_PASS\r"; exp_continue }
-            -re "\\\?.*:" { send "\r"; exp_continue }
-            -re "\\\? " { send "\r"; exp_continue }
-            timeout { puts "Timeout!"; exit 1 }
+            -re {Password[^\r\n]*:} { send "$pass\r"; exp_continue }
+            -re {[Yy]/[Nn]}         { send "y\r"; exp_continue }
+            -re {\?[^\r\n]*}        { send "\r"; exp_continue }
+            timeout                 { puts "TIMEOUT"; exit 1 }
             eof
           }
-          EOF
+          EXP_EOF
+          chmod +x init.exp
+          ./init.exp "$MANIFEST_URL" "$KEYSTORE_PASS"
           ls -la project
 
       - name: Copy keystore into project
