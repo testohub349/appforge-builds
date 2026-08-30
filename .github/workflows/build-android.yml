@@ -1,0 +1,154 @@
+name: AppForge Android Build
+
+on:
+  repository_dispatch:
+    types: [appforge-build]
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'AppForge build id'
+        required: true
+      manifest_url:
+        description: 'URL to twa-manifest.json'
+        required: true
+      callback_url:
+        description: 'Callback URL'
+        required: true
+      callback_secret:
+        description: 'HMAC secret'
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      BUILD_ID: ${{ github.event.client_payload.build_id || inputs.build_id }}
+      APP_ID: ${{ github.event.client_payload.app_id }}
+      MANIFEST_URL: ${{ github.event.client_payload.manifest_url || inputs.manifest_url }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url }}
+      CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret || inputs.callback_secret }}
+      SUPABASE_URL: ${{ github.event.client_payload.supabase_url }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      UPLOAD_PREFIX: ${{ github.event.client_payload.upload_prefix }}
+
+    steps:
+      - name: Report running
+        run: |
+          curl -s -X POST "$CALLBACK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Appforge-Secret: $CALLBACK_SECRET" \
+            -d "{\"status\":\"running\",\"logs\":\"Runner started on GitHub Actions\",\"gh_run_id\":\"${{ github.run_id }}\"}" || true
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Bubblewrap CLI
+        run: npm install -g @bubblewrap/cli@1.24.1
+
+      - name: Fetch AppForge manifest
+        run: |
+          mkdir -p work && cd work
+          curl -sfL "$MANIFEST_URL" -o twa-manifest.json
+          echo "Manifest content:"
+          cat twa-manifest.json | head -80
+
+      - name: Generate keystore
+        working-directory: work
+        run: |
+          KEYSTORE_PASS=$(openssl rand -hex 16)
+          KEY_PASS=$(openssl rand -hex 16)
+          echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
+          echo "KEY_PASS=$KEY_PASS" >> $GITHUB_ENV
+          keytool -genkeypair -v \
+            -keystore android.keystore \
+            -alias android \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KEYSTORE_PASS" -keypass "$KEY_PASS" \
+            -dname "CN=AppForge, OU=Generated, O=AppForge AI, L=Cloud, S=NA, C=US"
+
+      - name: Bubblewrap init
+        working-directory: work
+        run: |
+          echo yes | bubblewrap init --manifest=./twa-manifest.json --directory=./project --skipPwaValidation || true
+          ls -la project || true
+
+      - name: Bubblewrap build
+        working-directory: work/project
+        env:
+          BUBBLEWRAP_TERMS_ACCEPTED: 'true'
+        run: |
+          # Use non-interactive mode with piped answers
+          printf '%s\n%s\n%s\n' "$KEYSTORE_PASS" "$KEY_PASS" "y" | bubblewrap build --skipPwaValidation || {
+            echo 'Bubblewrap build failed, dumping logs...'
+            ls -la
+            exit 1
+          }
+          ls -la
+
+      - name: Locate outputs
+        id: outputs
+        working-directory: work/project
+        run: |
+          APK=$(ls app-release-signed.apk 2>/dev/null || ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -n1)
+          AAB=$(ls app-release-bundle.aab 2>/dev/null || ls app/build/outputs/bundle/release/*.aab 2>/dev/null | head -n1)
+          echo "apk=$APK" >> $GITHUB_OUTPUT
+          echo "aab=$AAB" >> $GITHUB_OUTPUT
+          echo "Found APK: $APK"
+          echo "Found AAB: $AAB"
+
+      - name: Upload artifacts to Supabase Storage
+        id: upload
+        working-directory: work/project
+        run: |
+          APK_PATH="${{ steps.outputs.outputs.apk }}"
+          AAB_PATH="${{ steps.outputs.outputs.aab }}"
+          APK_KEY="$UPLOAD_PREFIX/app-release-signed.apk"
+          AAB_KEY="$UPLOAD_PREFIX/app-release-bundle.aab"
+          if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
+            curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$APK_KEY" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "apikey: $SUPABASE_KEY" \
+              -H "Content-Type: application/vnd.android.package-archive" \
+              -H "x-upsert: true" \
+              --data-binary @"$APK_PATH"
+            echo "apk_key=$APK_KEY" >> $GITHUB_OUTPUT
+            echo "apk_size=$(stat -c%s "$APK_PATH")" >> $GITHUB_OUTPUT
+          fi
+          if [ -n "$AAB_PATH" ] && [ -f "$AAB_PATH" ]; then
+            curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$AAB_KEY" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "apikey: $SUPABASE_KEY" \
+              -H "Content-Type: application/octet-stream" \
+              -H "x-upsert: true" \
+              --data-binary @"$AAB_PATH"
+            echo "aab_key=$AAB_KEY" >> $GITHUB_OUTPUT
+            echo "aab_size=$(stat -c%s "$AAB_PATH")" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Report success
+        if: success()
+        run: |
+          curl -sSf -X POST "$CALLBACK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Appforge-Secret: $CALLBACK_SECRET" \
+            -d "{\"status\":\"success\",\"apk_file\":\"${{ steps.upload.outputs.apk_key }}\",\"aab_file\":\"${{ steps.upload.outputs.aab_key }}\",\"apk_size\":${{ steps.upload.outputs.apk_size || 0 }},\"aab_size\":${{ steps.upload.outputs.aab_size || 0 }},\"logs\":\"Build completed and artifacts uploaded.\",\"gh_run_id\":\"${{ github.run_id }}\"}"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          curl -s -X POST "$CALLBACK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Appforge-Secret: $CALLBACK_SECRET" \
+            -d "{\"status\":\"failed\",\"logs\":\"Build failed. See GitHub Actions run ${{ github.run_id }} for details.\",\"gh_run_id\":\"${{ github.run_id }}\"}" || true
