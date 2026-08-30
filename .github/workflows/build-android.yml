@@ -26,6 +26,7 @@ jobs:
       BUILD_ID: ${{ github.event.client_payload.build_id || inputs.build_id }}
       APP_ID: ${{ github.event.client_payload.app_id }}
       MANIFEST_URL: ${{ github.event.client_payload.manifest_url || inputs.manifest_url }}
+      TWA_MANIFEST_URL: ${{ github.event.client_payload.twa_manifest_url }}
       CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url }}
       CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret || inputs.callback_secret }}
       SUPABASE_URL: ${{ github.event.client_payload.supabase_url }}
@@ -71,16 +72,9 @@ jobs:
           echo "Bubblewrap config:"
           cat ~/.bubblewrap/config.json
 
-      - name: Fetch AppForge manifest
+      - name: Generate keystore
         run: |
           mkdir -p work && cd work
-          curl -sfL "$MANIFEST_URL" -o twa-manifest.json
-          echo "Manifest content:"
-          cat twa-manifest.json | head -80
-
-      - name: Generate keystore
-        working-directory: work
-        run: |
           KEYSTORE_PASS=$(openssl rand -hex 16)
           echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
           echo "KEY_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
@@ -91,12 +85,19 @@ jobs:
             -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" \
             -dname "CN=AppForge, OU=Generated, O=AppForge AI, L=Cloud, S=NA, C=US"
 
-      - name: Bubblewrap init
+      - name: Fetch AppForge web manifest
+        run: |
+          echo "== Web manifest =="
+          curl -sfL "$MANIFEST_URL" -o work/web-manifest.json
+          cat work/web-manifest.json
+          echo ""
+
+      - name: Bubblewrap init from web manifest
         working-directory: work
         run: |
           mkdir -p project
-          # Pre-answer any residual prompts with Y and blank enters
-          yes '' | bubblewrap init --manifest=./twa-manifest.json --directory=./project --skipPwaValidation
+          # Init using the hosted PWA manifest URL (bubblewrap validates the URL scheme)
+          bubblewrap init --manifest="$MANIFEST_URL" --directory=./project --skipPwaValidation
           ls -la project
 
       - name: Copy keystore into project
@@ -104,6 +105,15 @@ jobs:
         run: |
           cp android.keystore project/android.keystore
           ls -la project
+
+      - name: Overwrite generated twa-manifest.json with AppForge TWA manifest
+        working-directory: work/project
+        run: |
+          curl -sfL "$TWA_MANIFEST_URL" -o twa-manifest.json
+          echo "== Applied TWA manifest =="
+          cat twa-manifest.json
+          # Regenerate Gradle/Android files from the updated manifest
+          bubblewrap update --skipVersionUpgrade || true
 
       - name: Bubblewrap build
         working-directory: work/project
