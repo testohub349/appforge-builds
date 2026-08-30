@@ -53,9 +53,23 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-33 build-tools;33.0.2'
 
       - name: Install Bubblewrap CLI
         run: npm install -g @bubblewrap/cli@1.24.1
+
+      - name: Pre-configure Bubblewrap (skip interactive prompts)
+        run: |
+          mkdir -p ~/.bubblewrap
+          cat > ~/.bubblewrap/config.json <<EOF
+          {
+            "jdkPath": "$JAVA_HOME",
+            "androidSdkPath": "$ANDROID_HOME"
+          }
+          EOF
+          echo "Bubblewrap config:"
+          cat ~/.bubblewrap/config.json
 
       - name: Fetch AppForge manifest
         run: |
@@ -68,41 +82,51 @@ jobs:
         working-directory: work
         run: |
           KEYSTORE_PASS=$(openssl rand -hex 16)
-          KEY_PASS=$(openssl rand -hex 16)
           echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
-          echo "KEY_PASS=$KEY_PASS" >> $GITHUB_ENV
+          echo "KEY_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
           keytool -genkeypair -v \
             -keystore android.keystore \
             -alias android \
             -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass "$KEYSTORE_PASS" -keypass "$KEY_PASS" \
+            -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" \
             -dname "CN=AppForge, OU=Generated, O=AppForge AI, L=Cloud, S=NA, C=US"
 
       - name: Bubblewrap init
         working-directory: work
         run: |
-          echo yes | bubblewrap init --manifest=./twa-manifest.json --directory=./project --skipPwaValidation || true
-          ls -la project || true
+          bubblewrap init --manifest=./twa-manifest.json --directory=./project --skipPwaValidation
+          ls -la project
+
+      - name: Copy keystore into project
+        working-directory: work
+        run: |
+          cp android.keystore project/android.keystore
+          ls -la project
 
       - name: Bubblewrap build
         working-directory: work/project
-        env:
-          BUBBLEWRAP_TERMS_ACCEPTED: 'true'
         run: |
-          # Use non-interactive mode with piped answers
-          printf '%s\n%s\n%s\n' "$KEYSTORE_PASS" "$KEY_PASS" "y" | bubblewrap build --skipPwaValidation || {
-            echo 'Bubblewrap build failed, dumping logs...'
-            ls -la
-            exit 1
-          }
+          bubblewrap build \
+            --skipPwaValidation \
+            --signingKeyPath=./android.keystore \
+            --signingKeyAlias=android \
+            --keystorePassword="$KEYSTORE_PASS" \
+            --keyPassword="$KEY_PASS"
+          echo "Contents after build:"
           ls -la
+          echo "APKs found:"
+          find . -name '*.apk' 2>/dev/null
+          echo "AABs found:"
+          find . -name '*.aab' 2>/dev/null
 
       - name: Locate outputs
         id: outputs
         working-directory: work/project
         run: |
-          APK=$(ls app-release-signed.apk 2>/dev/null || ls app/build/outputs/apk/release/*.apk 2>/dev/null | head -n1)
-          AAB=$(ls app-release-bundle.aab 2>/dev/null || ls app/build/outputs/bundle/release/*.aab 2>/dev/null | head -n1)
+          APK=$(ls app-release-signed.apk 2>/dev/null || find . -name '*-release-signed.apk' 2>/dev/null | head -n1)
+          if [ -z "$APK" ]; then APK=$(find . -name '*.apk' 2>/dev/null | head -n1); fi
+          AAB=$(ls app-release-bundle.aab 2>/dev/null || find . -name '*-release-bundle.aab' 2>/dev/null | head -n1)
+          if [ -z "$AAB" ]; then AAB=$(find . -name '*.aab' 2>/dev/null | head -n1); fi
           echo "apk=$APK" >> $GITHUB_OUTPUT
           echo "aab=$AAB" >> $GITHUB_OUTPUT
           echo "Found APK: $APK"
@@ -117,6 +141,7 @@ jobs:
           APK_KEY="$UPLOAD_PREFIX/app-release-signed.apk"
           AAB_KEY="$UPLOAD_PREFIX/app-release-bundle.aab"
           if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
+            echo "Uploading APK ($(stat -c%s "$APK_PATH") bytes)..."
             curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$APK_KEY" \
               -H "Authorization: Bearer $SUPABASE_KEY" \
               -H "apikey: $SUPABASE_KEY" \
@@ -127,6 +152,7 @@ jobs:
             echo "apk_size=$(stat -c%s "$APK_PATH")" >> $GITHUB_OUTPUT
           fi
           if [ -n "$AAB_PATH" ] && [ -f "$AAB_PATH" ]; then
+            echo "Uploading AAB ($(stat -c%s "$AAB_PATH") bytes)..."
             curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$AAB_KEY" \
               -H "Authorization: Bearer $SUPABASE_KEY" \
               -H "apikey: $SUPABASE_KEY" \
