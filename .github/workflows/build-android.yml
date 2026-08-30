@@ -94,7 +94,9 @@ jobs:
       - name: Bubblewrap init
         working-directory: work
         run: |
-          bubblewrap init --manifest=./twa-manifest.json --directory=./project --skipPwaValidation
+          mkdir -p project
+          # Pre-answer any residual prompts with Y and blank enters
+          yes '' | bubblewrap init --manifest=./twa-manifest.json --directory=./project --skipPwaValidation
           ls -la project
 
       - name: Copy keystore into project
