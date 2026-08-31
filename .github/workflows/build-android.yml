@@ -141,8 +141,8 @@ jobs:
           fi
 
           echo "::add-mask::$KEYSTORE_PASS"
-          echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
-          echo "KEY_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+          echo "BUBBLEWRAP_KEYSTORE_PASSWORD=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+          echo "BUBBLEWRAP_KEY_PASSWORD=$KEYSTORE_PASS" >> "$GITHUB_ENV"
 
       - name: Scaffold TWA project (non-interactive)
         run: node scaffold.js "$MANIFEST_URL" ./work/project
@@ -177,9 +177,7 @@ jobs:
           npx --package=@bubblewrap/cli@1.24.1 -- bubblewrap build \
             --skipPwaValidation \
             --signingKeyPath=./android.keystore \
-            --signingKeyAlias=android \
-            --keystorePassword="$KEYSTORE_PASS" \
-            --keyPassword="$KEY_PASS"
+            --signingKeyAlias=android
           echo "Contents after build:"
           ls -la
           echo "APKs:" && find . -name '*.apk' 2>/dev/null
