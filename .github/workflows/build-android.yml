@@ -9,7 +9,10 @@ on:
         description: 'AppForge build id'
         required: true
       manifest_url:
-        description: 'URL to twa-manifest.json'
+        description: 'URL to web manifest'
+        required: true
+      twa_manifest_url:
+        description: 'URL to TWA manifest'
         required: true
       callback_url:
         description: 'Callback URL'
@@ -26,7 +29,7 @@ jobs:
       BUILD_ID: ${{ github.event.client_payload.build_id || inputs.build_id }}
       APP_ID: ${{ github.event.client_payload.app_id }}
       MANIFEST_URL: ${{ github.event.client_payload.manifest_url || inputs.manifest_url }}
-      TWA_MANIFEST_URL: ${{ github.event.client_payload.twa_manifest_url }}
+      TWA_MANIFEST_URL: ${{ github.event.client_payload.twa_manifest_url || inputs.twa_manifest_url }}
       CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url }}
       CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret || inputs.callback_secret }}
       SUPABASE_URL: ${{ github.event.client_payload.supabase_url }}
@@ -34,6 +37,9 @@ jobs:
       UPLOAD_PREFIX: ${{ github.event.client_payload.upload_prefix }}
 
     steps:
+      - name: Checkout build runner
+        uses: actions/checkout@v4
+
       - name: Report running
         run: |
           curl -s -X POST "$CALLBACK_URL" \
@@ -57,24 +63,13 @@ jobs:
         with:
           packages: 'platform-tools platforms;android-33 build-tools;33.0.2'
 
-      - name: Install Bubblewrap CLI
-        run: npm install -g @bubblewrap/cli@1.24.1
-
-      - name: Pre-configure Bubblewrap (skip interactive prompts)
-        run: |
-          mkdir -p ~/.bubblewrap
-          cat > ~/.bubblewrap/config.json <<EOF
-          {
-            "jdkPath": "$JAVA_HOME",
-            "androidSdkPath": "$ANDROID_HOME"
-          }
-          EOF
-          echo "Bubblewrap config:"
-          cat ~/.bubblewrap/config.json
+      - name: Install runner dependencies
+        run: npm ci || npm install
 
       - name: Generate keystore
         run: |
-          mkdir -p work && cd work
+          mkdir -p work
+          cd work
           KEYSTORE_PASS=$(openssl rand -hex 16)
           echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
           echo "KEY_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
@@ -85,56 +80,26 @@ jobs:
             -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" \
             -dname "CN=AppForge, OU=Generated, O=AppForge AI, L=Cloud, S=NA, C=US"
 
-      - name: Fetch AppForge web manifest
-        run: |
-          echo "== Web manifest =="
-          curl -sfL "$MANIFEST_URL" -o work/web-manifest.json
-          cat work/web-manifest.json
-          echo ""
-
-      - name: Bubblewrap init from web manifest
-        working-directory: work
-        run: |
-          mkdir -p project
-          sudo apt-get install -y expect >/dev/null 2>&1 || true
-          # Write expect script to a file to avoid heredoc/tcl escaping issues
-          cat > init.exp <<'EXP_EOF'
-          #!/usr/bin/expect -f
-          set timeout 600
-          set url [lindex $argv 0]
-          set pass [lindex $argv 1]
-          spawn bubblewrap init --manifest=$url --directory=./project --skipPwaValidation
-          expect {
-            -re {Password[^\r\n]*:} { send "$pass\r"; exp_continue }
-            -re {[Yy]/[Nn]}         { send "y\r"; exp_continue }
-            -re {\?[^\r\n]*}        { send "\r"; exp_continue }
-            timeout                 { puts "TIMEOUT"; exit 1 }
-            eof
-          }
-          EXP_EOF
-          chmod +x init.exp
-          ./init.exp "$MANIFEST_URL" "$KEYSTORE_PASS"
-          ls -la project
+      - name: Scaffold TWA project (non-interactive)
+        run: node scaffold.js "$TWA_MANIFEST_URL" ./work/project
 
       - name: Copy keystore into project
-        working-directory: work
-        run: |
-          cp android.keystore project/android.keystore
-          ls -la project
+        run: cp work/android.keystore work/project/android.keystore
 
-      - name: Overwrite generated twa-manifest.json with AppForge TWA manifest
-        working-directory: work/project
+      - name: Configure Bubblewrap CLI paths
         run: |
-          curl -sfL "$TWA_MANIFEST_URL" -o twa-manifest.json
-          echo "== Applied TWA manifest =="
-          cat twa-manifest.json
-          # Regenerate Gradle/Android files from the updated manifest
-          bubblewrap update --skipVersionUpgrade || true
+          mkdir -p ~/.bubblewrap
+          cat > ~/.bubblewrap/config.json <<EOF
+          {
+            "jdkPath": "$JAVA_HOME",
+            "androidSdkPath": "$ANDROID_HOME"
+          }
+          EOF
 
       - name: Bubblewrap build
         working-directory: work/project
         run: |
-          bubblewrap build \
+          npx --package=@bubblewrap/cli@1.24.1 -- bubblewrap build \
             --skipPwaValidation \
             --signingKeyPath=./android.keystore \
             --signingKeyAlias=android \
@@ -142,18 +107,16 @@ jobs:
             --keyPassword="$KEY_PASS"
           echo "Contents after build:"
           ls -la
-          echo "APKs found:"
-          find . -name '*.apk' 2>/dev/null
-          echo "AABs found:"
-          find . -name '*.aab' 2>/dev/null
+          echo "APKs:" && find . -name '*.apk' 2>/dev/null
+          echo "AABs:" && find . -name '*.aab' 2>/dev/null
 
       - name: Locate outputs
         id: outputs
         working-directory: work/project
         run: |
-          APK=$(ls app-release-signed.apk 2>/dev/null || find . -name '*-release-signed.apk' 2>/dev/null | head -n1)
+          APK=$(find . -name '*-release-signed.apk' 2>/dev/null | head -n1)
           if [ -z "$APK" ]; then APK=$(find . -name '*.apk' 2>/dev/null | head -n1); fi
-          AAB=$(ls app-release-bundle.aab 2>/dev/null || find . -name '*-release-bundle.aab' 2>/dev/null | head -n1)
+          AAB=$(find . -name '*-release-bundle.aab' 2>/dev/null | head -n1)
           if [ -z "$AAB" ]; then AAB=$(find . -name '*.aab' 2>/dev/null | head -n1); fi
           echo "apk=$APK" >> $GITHUB_OUTPUT
           echo "aab=$AAB" >> $GITHUB_OUTPUT
@@ -168,8 +131,11 @@ jobs:
           AAB_PATH="${{ steps.outputs.outputs.aab }}"
           APK_KEY="$UPLOAD_PREFIX/app-release-signed.apk"
           AAB_KEY="$UPLOAD_PREFIX/app-release-bundle.aab"
+          APK_SIZE=0
+          AAB_SIZE=0
           if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
-            echo "Uploading APK ($(stat -c%s "$APK_PATH") bytes)..."
+            APK_SIZE=$(stat -c%s "$APK_PATH")
+            echo "Uploading APK ($APK_SIZE bytes)..."
             curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$APK_KEY" \
               -H "Authorization: Bearer $SUPABASE_KEY" \
               -H "apikey: $SUPABASE_KEY" \
@@ -177,10 +143,10 @@ jobs:
               -H "x-upsert: true" \
               --data-binary @"$APK_PATH"
             echo "apk_key=$APK_KEY" >> $GITHUB_OUTPUT
-            echo "apk_size=$(stat -c%s "$APK_PATH")" >> $GITHUB_OUTPUT
           fi
           if [ -n "$AAB_PATH" ] && [ -f "$AAB_PATH" ]; then
-            echo "Uploading AAB ($(stat -c%s "$AAB_PATH") bytes)..."
+            AAB_SIZE=$(stat -c%s "$AAB_PATH")
+            echo "Uploading AAB ($AAB_SIZE bytes)..."
             curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$AAB_KEY" \
               -H "Authorization: Bearer $SUPABASE_KEY" \
               -H "apikey: $SUPABASE_KEY" \
@@ -188,8 +154,9 @@ jobs:
               -H "x-upsert: true" \
               --data-binary @"$AAB_PATH"
             echo "aab_key=$AAB_KEY" >> $GITHUB_OUTPUT
-            echo "aab_size=$(stat -c%s "$AAB_PATH")" >> $GITHUB_OUTPUT
           fi
+          echo "apk_size=$APK_SIZE" >> $GITHUB_OUTPUT
+          echo "aab_size=$AAB_SIZE" >> $GITHUB_OUTPUT
 
       - name: Report success
         if: success()
