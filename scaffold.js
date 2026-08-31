@@ -36,11 +36,20 @@ async function main() {
   twaJson.appVersion = twaJson.appVersion || twaJson.appVersionName || `1.0.${versionCode}`
   delete twaJson.appVersionName
 
+  // Bubblewrap 1.24.1 does not apply its documented 300 ms default when loading
+  // a TWA manifest from JSON. An omitted value becomes `splashScreenFadeOutDuration: ,`
+  // in build.gradle, so normalize it before project generation.
+  const splashDuration = Number(twaJson.splashScreenFadeOutDuration)
+  twaJson.splashScreenFadeOutDuration = Number.isFinite(splashDuration) && splashDuration >= 0
+    ? splashDuration
+    : 300
+
   console.log(
     'Manifest received. packageId =', twaJson.packageId,
     'host =', twaJson.host,
     'versionCode =', twaJson.appVersionCode,
     'version =', twaJson.appVersion,
+    'splashFadeMs =', twaJson.splashScreenFadeOutDuration,
   )
 
   const tmpPath = '/tmp/appforge-twa-manifest.json'
