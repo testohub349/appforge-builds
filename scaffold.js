@@ -5,6 +5,7 @@
  *
  * Usage: node scaffold.js <twa_manifest_url> <project_dir>
  */
+const crypto = require('crypto')
 const fs = require('fs')
 const path = require('path')
 const { TwaGenerator, TwaManifest, ConsoleLog } = require('@bubblewrap/core')
@@ -53,8 +54,17 @@ async function main() {
 
   const gen = new TwaGenerator()
   await gen.createTwaProject(projectDir, manifest, new ConsoleLog('appforge'))
-  // Persist a copy inside project for `bubblewrap build` later.
-  fs.copyFileSync(tmpPath, path.join(projectDir, 'twa-manifest.json'))
+
+  // Persist the exact manifest used to generate the project.
+  const projectManifestPath = path.join(projectDir, 'twa-manifest.json')
+  fs.copyFileSync(tmpPath, projectManifestPath)
+
+  // Bubblewrap build checks this SHA-1 before building. Its interactive update/init
+  // commands normally create it; our non-interactive scaffold must do the same.
+  const manifestContents = fs.readFileSync(projectManifestPath)
+  const manifestChecksum = crypto.createHash('sha1').update(manifestContents).digest('hex')
+  fs.writeFileSync(path.join(projectDir, 'manifest-checksum.txt'), manifestChecksum)
+
   console.log('Scaffold ready at', projectDir)
 }
 
