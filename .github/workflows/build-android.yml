@@ -9,27 +9,23 @@ on:
         description: 'AppForge build id'
         required: true
       manifest_url:
-        description: 'URL to web manifest'
-        required: true
-      twa_manifest_url:
-        description: 'URL to TWA manifest'
+        description: 'URL to AppForge TWA manifest'
         required: true
       callback_url:
         description: 'Callback URL'
         required: true
       callback_secret:
-        description: 'HMAC secret'
+        description: 'Build callback secret'
         required: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       BUILD_ID: ${{ github.event.client_payload.build_id || inputs.build_id }}
       APP_ID: ${{ github.event.client_payload.app_id }}
       MANIFEST_URL: ${{ github.event.client_payload.manifest_url || inputs.manifest_url }}
-      TWA_MANIFEST_URL: ${{ github.event.client_payload.twa_manifest_url || inputs.twa_manifest_url }}
       CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url }}
       CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret || inputs.callback_secret }}
       SUPABASE_URL: ${{ github.event.client_payload.supabase_url }}
@@ -45,7 +41,15 @@ jobs:
           curl -s -X POST "$CALLBACK_URL" \
             -H 'Content-Type: application/json' \
             -H "X-Appforge-Secret: $CALLBACK_SECRET" \
-            -d "{\"status\":\"running\",\"logs\":\"Runner started on GitHub Actions\",\"gh_run_id\":\"${{ github.run_id }}\"}" || true
+            -d "{\"status\":\"running\",\"logs\":\"Runner started on GitHub Actions. Building for Android API 36.\",\"gh_run_id\":\"${{ github.run_id }}\"}" || true
+
+          # Keep live build metadata aligned with the actual generated artifact.
+          curl -sSf -X PATCH "$SUPABASE_URL/rest/v1/builds?id=eq.$BUILD_ID" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H 'Content-Type: application/json' \
+            -H 'Prefer: return=minimal' \
+            -d '{"target_api_level":36}' || true
 
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
@@ -58,30 +62,100 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
+      - name: Setup Android SDK 36
         uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-33 build-tools;33.0.2'
+          packages: 'platform-tools platforms;android-36 build-tools;34.0.0'
+
+      - name: Prepare Bubblewrap Android SDK compatibility
+        run: |
+          set -euo pipefail
+          SDKMANAGER_PATH="$(command -v sdkmanager)"
+          SDKMANAGER_DIR="$(dirname "$(readlink -f "$SDKMANAGER_PATH")")"
+          echo "Android SDK: $ANDROID_HOME"
+          echo "sdkmanager: $SDKMANAGER_PATH"
+
+          # Bubblewrap 1.24.1 validates that androidSdkPath contains a root-level
+          # bin/ or tools/ directory. setup-android keeps sdkmanager under
+          # cmdline-tools/<version>/bin, so expose a compatible root-level bin.
+          if [ ! -e "$ANDROID_HOME/bin" ]; then
+            ln -s "$SDKMANAGER_DIR" "$ANDROID_HOME/bin"
+          fi
+
+          test -x "$ANDROID_HOME/bin/sdkmanager"
+          test -d "$ANDROID_HOME/build-tools/34.0.0"
+          test -d "$ANDROID_HOME/platforms/android-36"
 
       - name: Install runner dependencies
-        run: npm ci || npm install
+        run: npm install --no-audit --no-fund
 
-      - name: Generate keystore
+      - name: Restore or create stable app signing key
         run: |
+          set -euo pipefail
           mkdir -p work
-          cd work
-          KEYSTORE_PASS=$(openssl rand -hex 16)
-          echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
-          echo "KEY_PASS=$KEYSTORE_PASS" >> $GITHUB_ENV
-          keytool -genkeypair -v \
-            -keystore android.keystore \
-            -alias android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" \
-            -dname "CN=AppForge, OU=Generated, O=AppForge AI, L=Cloud, S=NA, C=US"
+          SIGNING_ID="${APP_ID:-$BUILD_ID}"
+          KEYSTORE_PREFIX="keystores/$SIGNING_ID"
+          KEYSTORE_OBJECT="$KEYSTORE_PREFIX/android.keystore"
+          PASSWORD_OBJECT="$KEYSTORE_PREFIX/android.keystore.pass"
+
+          set +e
+          curl -sSf "$SUPABASE_URL/storage/v1/object/authenticated/appforge-artifacts/$KEYSTORE_OBJECT" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -o work/android.keystore
+          KEYSTORE_FETCH=$?
+          curl -sSf "$SUPABASE_URL/storage/v1/object/authenticated/appforge-artifacts/$PASSWORD_OBJECT" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -o work/android.keystore.pass
+          PASSWORD_FETCH=$?
+          set -e
+
+          if [ "$KEYSTORE_FETCH" -eq 0 ] && [ "$PASSWORD_FETCH" -eq 0 ] && [ -s work/android.keystore ] && [ -s work/android.keystore.pass ]; then
+            KEYSTORE_PASS="$(cat work/android.keystore.pass)"
+            echo "Restored existing signing key for app $SIGNING_ID"
+          else
+            rm -f work/android.keystore work/android.keystore.pass
+            KEYSTORE_PASS="$(openssl rand -hex 24)"
+            printf '%s' "$KEYSTORE_PASS" > work/android.keystore.pass
+            keytool -genkeypair -v \
+              -keystore work/android.keystore \
+              -alias android \
+              -keyalg RSA -keysize 3072 -validity 10000 \
+              -storepass "$KEYSTORE_PASS" -keypass "$KEYSTORE_PASS" \
+              -dname "CN=AppForge, OU=Generated, O=AppForge AI, L=Cloud, S=NA, C=US"
+
+            curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$KEYSTORE_OBJECT" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "apikey: $SUPABASE_KEY" \
+              -H 'Content-Type: application/octet-stream' \
+              -H 'x-upsert: true' \
+              --data-binary @work/android.keystore > /dev/null
+            curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$PASSWORD_OBJECT" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "apikey: $SUPABASE_KEY" \
+              -H 'Content-Type: text/plain' \
+              -H 'x-upsert: true' \
+              --data-binary @work/android.keystore.pass > /dev/null
+            echo "Created and persisted signing key for app $SIGNING_ID"
+          fi
+
+          echo "::add-mask::$KEYSTORE_PASS"
+          echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+          echo "KEY_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
 
       - name: Scaffold TWA project (non-interactive)
-        run: node scaffold.js "$TWA_MANIFEST_URL" ./work/project
+        run: node scaffold.js "$MANIFEST_URL" ./work/project
+
+      - name: Target Android API 36
+        working-directory: work/project
+        run: |
+          set -euo pipefail
+          # Bubblewrap 1.24.1 compiles with SDK 36 but its template still targets 35.
+          # Patch the generated project to meet current Google Play target requirements.
+          sed -Ei 's/targetSdkVersion[[:space:]]+[0-9]+/targetSdkVersion 36/' app/build.gradle
+          grep -E 'compileSdkVersion|targetSdkVersion|versionCode|versionName' app/build.gradle
+          grep -qE 'targetSdkVersion[[:space:]]+36' app/build.gradle
 
       - name: Copy keystore into project
         run: cp work/android.keystore work/project/android.keystore
@@ -99,6 +173,7 @@ jobs:
       - name: Bubblewrap build
         working-directory: work/project
         run: |
+          set -euo pipefail
           npx --package=@bubblewrap/cli@1.24.1 -- bubblewrap build \
             --skipPwaValidation \
             --signingKeyPath=./android.keystore \
@@ -110,16 +185,27 @@ jobs:
           echo "APKs:" && find . -name '*.apk' 2>/dev/null
           echo "AABs:" && find . -name '*.aab' 2>/dev/null
 
-      - name: Locate outputs
+      - name: Locate and validate outputs
         id: outputs
         working-directory: work/project
         run: |
-          APK=$(find . -name '*-release-signed.apk' 2>/dev/null | head -n1)
-          if [ -z "$APK" ]; then APK=$(find . -name '*.apk' 2>/dev/null | head -n1); fi
-          AAB=$(find . -name '*-release-bundle.aab' 2>/dev/null | head -n1)
-          if [ -z "$AAB" ]; then AAB=$(find . -name '*.aab' 2>/dev/null | head -n1); fi
-          echo "apk=$APK" >> $GITHUB_OUTPUT
-          echo "aab=$AAB" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          APK=$(find . -name '*-release-signed.apk' 2>/dev/null | head -n1 || true)
+          if [ -z "$APK" ]; then APK=$(find . -name '*.apk' 2>/dev/null | head -n1 || true); fi
+          AAB=$(find . -name '*-release-bundle.aab' 2>/dev/null | head -n1 || true)
+          if [ -z "$AAB" ]; then AAB=$(find . -name '*.aab' 2>/dev/null | head -n1 || true); fi
+
+          if [ -z "$APK" ] || [ ! -s "$APK" ]; then
+            echo "No usable APK produced" >&2
+            exit 1
+          fi
+          if [ -z "$AAB" ] || [ ! -s "$AAB" ]; then
+            echo "No usable AAB produced" >&2
+            exit 1
+          fi
+
+          echo "apk=$APK" >> "$GITHUB_OUTPUT"
+          echo "aab=$AAB" >> "$GITHUB_OUTPUT"
           echo "Found APK: $APK"
           echo "Found AAB: $AAB"
 
@@ -127,36 +213,34 @@ jobs:
         id: upload
         working-directory: work/project
         run: |
+          set -euo pipefail
           APK_PATH="${{ steps.outputs.outputs.apk }}"
           AAB_PATH="${{ steps.outputs.outputs.aab }}"
           APK_KEY="$UPLOAD_PREFIX/app-release-signed.apk"
           AAB_KEY="$UPLOAD_PREFIX/app-release-bundle.aab"
-          APK_SIZE=0
-          AAB_SIZE=0
-          if [ -n "$APK_PATH" ] && [ -f "$APK_PATH" ]; then
-            APK_SIZE=$(stat -c%s "$APK_PATH")
-            echo "Uploading APK ($APK_SIZE bytes)..."
-            curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$APK_KEY" \
-              -H "Authorization: Bearer $SUPABASE_KEY" \
-              -H "apikey: $SUPABASE_KEY" \
-              -H "Content-Type: application/vnd.android.package-archive" \
-              -H "x-upsert: true" \
-              --data-binary @"$APK_PATH"
-            echo "apk_key=$APK_KEY" >> $GITHUB_OUTPUT
-          fi
-          if [ -n "$AAB_PATH" ] && [ -f "$AAB_PATH" ]; then
-            AAB_SIZE=$(stat -c%s "$AAB_PATH")
-            echo "Uploading AAB ($AAB_SIZE bytes)..."
-            curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$AAB_KEY" \
-              -H "Authorization: Bearer $SUPABASE_KEY" \
-              -H "apikey: $SUPABASE_KEY" \
-              -H "Content-Type: application/octet-stream" \
-              -H "x-upsert: true" \
-              --data-binary @"$AAB_PATH"
-            echo "aab_key=$AAB_KEY" >> $GITHUB_OUTPUT
-          fi
-          echo "apk_size=$APK_SIZE" >> $GITHUB_OUTPUT
-          echo "aab_size=$AAB_SIZE" >> $GITHUB_OUTPUT
+          APK_SIZE=$(stat -c%s "$APK_PATH")
+          AAB_SIZE=$(stat -c%s "$AAB_PATH")
+
+          echo "Uploading APK ($APK_SIZE bytes)..."
+          curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$APK_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Content-Type: application/vnd.android.package-archive" \
+            -H "x-upsert: true" \
+            --data-binary @"$APK_PATH" > /dev/null
+          echo "apk_key=$APK_KEY" >> "$GITHUB_OUTPUT"
+
+          echo "Uploading AAB ($AAB_SIZE bytes)..."
+          curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$AAB_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Content-Type: application/octet-stream" \
+            -H "x-upsert: true" \
+            --data-binary @"$AAB_PATH" > /dev/null
+          echo "aab_key=$AAB_KEY" >> "$GITHUB_OUTPUT"
+
+          echo "apk_size=$APK_SIZE" >> "$GITHUB_OUTPUT"
+          echo "aab_size=$AAB_SIZE" >> "$GITHUB_OUTPUT"
 
       - name: Report success
         if: success()
@@ -164,7 +248,7 @@ jobs:
           curl -sSf -X POST "$CALLBACK_URL" \
             -H 'Content-Type: application/json' \
             -H "X-Appforge-Secret: $CALLBACK_SECRET" \
-            -d "{\"status\":\"success\",\"apk_file\":\"${{ steps.upload.outputs.apk_key }}\",\"aab_file\":\"${{ steps.upload.outputs.aab_key }}\",\"apk_size\":${{ steps.upload.outputs.apk_size || 0 }},\"aab_size\":${{ steps.upload.outputs.aab_size || 0 }},\"logs\":\"Build completed and artifacts uploaded.\",\"gh_run_id\":\"${{ github.run_id }}\"}"
+            -d "{\"status\":\"success\",\"apk_file\":\"${{ steps.upload.outputs.apk_key }}\",\"aab_file\":\"${{ steps.upload.outputs.aab_key }}\",\"apk_size\":${{ steps.upload.outputs.apk_size || 0 }},\"aab_size\":${{ steps.upload.outputs.aab_size || 0 }},\"logs\":\"Android API 36 build completed and artifacts uploaded.\",\"gh_run_id\":\"${{ github.run_id }}\"}"
 
       - name: Report failure
         if: failure()
