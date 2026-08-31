@@ -3,31 +3,16 @@ name: AppForge Android Build
 on:
   repository_dispatch:
     types: [appforge-build]
-  workflow_dispatch:
-    inputs:
-      build_id:
-        description: 'AppForge build id'
-        required: true
-      manifest_url:
-        description: 'URL to AppForge TWA manifest'
-        required: true
-      callback_url:
-        description: 'Callback URL'
-        required: true
-      callback_secret:
-        description: 'Build callback secret'
-        required: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      BUILD_ID: ${{ github.event.client_payload.build_id || inputs.build_id }}
+      BUILD_ID: ${{ github.event.client_payload.build_id }}
       APP_ID: ${{ github.event.client_payload.app_id }}
-      MANIFEST_URL: ${{ github.event.client_payload.manifest_url || inputs.manifest_url }}
-      CALLBACK_URL: ${{ github.event.client_payload.callback_url || inputs.callback_url }}
-      CALLBACK_SECRET: ${{ github.event.client_payload.callback_secret || inputs.callback_secret }}
+      MANIFEST_URL: ${{ github.event.client_payload.manifest_url }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
       SUPABASE_URL: ${{ github.event.client_payload.supabase_url }}
       SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       UPLOAD_PREFIX: ${{ github.event.client_payload.upload_prefix }}
@@ -35,6 +20,23 @@ jobs:
     steps:
       - name: Checkout build runner
         uses: actions/checkout@v4
+
+      - name: Load private callback secret
+        run: |
+          set -euo pipefail
+          CALLBACK_SECRET="$(
+            curl -sSf "$SUPABASE_URL/rest/v1/builds?id=eq.$BUILD_ID&select=callback_secret" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "apikey: $SUPABASE_KEY" \
+              -H 'Accept: application/json' \
+            | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0].get("callback_secret", "") if rows else "")'
+          )"
+          if [ -z "$CALLBACK_SECRET" ]; then
+            echo "Build callback secret is missing" >&2
+            exit 1
+          fi
+          echo "::add-mask::$CALLBACK_SECRET"
+          echo "CALLBACK_SECRET=$CALLBACK_SECRET" >> "$GITHUB_ENV"
 
       - name: Report running
         run: |
