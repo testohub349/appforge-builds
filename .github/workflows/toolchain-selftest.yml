@@ -86,8 +86,8 @@ jobs:
           curl -fsS http://127.0.0.1:8765/selftest-manifest.json >/dev/null
 
           KEYSTORE_PASS='appforge-selftest-password'
-          echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
-          echo "KEY_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+          echo "BUBBLEWRAP_KEYSTORE_PASSWORD=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+          echo "BUBBLEWRAP_KEY_PASSWORD=$KEYSTORE_PASS" >> "$GITHUB_ENV"
           keytool -genkeypair \
             -keystore work/android.keystore \
             -alias android \
@@ -120,9 +120,7 @@ jobs:
           npx --package=@bubblewrap/cli@1.24.1 -- bubblewrap build \
             --skipPwaValidation \
             --signingKeyPath=./android.keystore \
-            --signingKeyAlias=android \
-            --keystorePassword="$KEYSTORE_PASS" \
-            --keyPassword="$KEY_PASS"
+            --signingKeyAlias=android
           APK=$(find . -name '*.apk' -type f | head -n1)
           AAB=$(find . -name '*.aab' -type f | head -n1)
           test -n "$APK" && test -s "$APK"
