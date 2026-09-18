@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+      <string name="app_name">AppForge WebView Template</string>
+      <string name="drawer_open">Open navigation menu</string>
+      <string name="drawer_close">Close navigation menu</string>
+      <string name="choose_file">Choose a file</string>
+      <string name="camera_permission_denied">Camera permission denied - gallery upload still available</string>
+      <string name="downloading_file">Downloading...</string>
+      <string name="download_started">Downloading %1$s</string>
+</resources>
+…
