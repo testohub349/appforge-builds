@@ -1,0 +1,34 @@
+{
+    "appName": "Sample Restaurant",
+    "websiteUrl": "https://example-restaurant.com",
+    "theme": {
+          "primaryColor": "#C9821A",
+          "secondaryColor": "#1A1A1A",
+          "darkMode": false,
+          "splashType": "logo",
+          "logoAssetPath": "splash_logo.png"
+    },
+    "navigation": {
+          "drawerItems": [
+                  { "id": "about", "label": "About Us", "targetUrl": "/about" },
+                  { "id": "contact", "label": "Contact", "targetUrl": "/contact" },
+                  { "id": "terms", "label": "Terms and Privacy", "targetUrl": "/legal" }
+          ],
+          "bottomNavItems": [
+                  { "id": "home", "label": "Home", "targetUrl": "/" },
+                  { "id": "menu", "label": "Menu", "targetUrl": "/menu" },
+                  { "id": "orders", "label": "My Orders", "targetUrl": "/orders" },
+                  { "id": "account", "label": "Account", "targetUrl": "/account" }
+          ]
+    },
+    "features": {
+          "fileUpload": true,
+          "fileDownload": true,
+          "cameraCapture": true,
+          "pushNotifications": false,
+          "pullToRefresh": true,
+          "shareButton": true,
+          "whatsappButton": true,
+          "whatsappNumber": "+15551234567"
+    }
+}
