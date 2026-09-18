@@ -1,0 +1,65 @@
+name: Build WebView App
+
+on:
+  repository_dispatch:
+    types: [build-webview-app]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Write app_config.json from build payload
+        env:
+          APP_CONFIG_JSON: ${{ toJson(github.event.client_payload.app_config) }}
+        run: echo "$APP_CONFIG_JSON" > app/src/main/assets/app_config.json
+
+      - name: Set applicationId, versionCode, versionName
+        env:
+          PACKAGE_NAME: ${{ github.event.client_payload.package_name }}
+          VERSION_CODE: ${{ github.event.client_payload.version_code }}
+          VERSION_NAME: ${{ github.event.client_payload.version_name }}
+        run: |
+          sed -i "s/com.appforge.generated/$PACKAGE_NAME/g" app/build.gradle.kts
+          sed -i "s/versionCode = 1/versionCode = $VERSION_CODE/" app/build.gradle.kts
+          sed -i "s/versionName = \"1.0.0\"/versionName = \"$VERSION_NAME\"/" app/build.gradle.kts
+
+      - name: Inject generated assets
+        env:
+          ASSET_BUNDLE_URL: ${{ github.event.client_payload.asset_bundle_url }}
+        run: |
+          curl -sSL "$ASSET_BUNDLE_URL" -o assets.zip
+          unzip -o assets.zip -d app/src/main/
+
+      - name: Decode per-app keystore
+        env:
+          KEYSTORE_B64: ${{ github.event.client_payload.keystore_b64 }}
+        run: echo "$KEYSTORE_B64" | base64 -d > app/release.keystore
+
+      - name: Build signed APK + AAB
+        env:
+          APPFORGE_KEYSTORE_PATH: release.keystore
+          APPFORGE_KEYSTORE_PASSWORD: ${{ secrets.BUILD_KEYSTORE_PASSWORD }}
+          APPFORGE_KEY_ALIAS: ${{ github.event.client_payload.key_alias }}
+          APPFORGE_KEY_PASSWORD: ${{ secrets.BUILD_KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease bundleRelease --no-daemon
+
+      - name: Verify artifacts are non-empty
+        run: |
+          test -s app/build/outputs/apk/release/app-release.apk
+          test -s app/build/outputs/bundle/release/app-release.aab
+
+      - name: Upload artifacts to storage
+        env:
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+          BUILD_ID: ${{ github.event.client_payload.build_id }}
+        run: |
+          echo "Upload + callback step"
