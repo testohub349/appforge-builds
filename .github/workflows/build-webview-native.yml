@@ -1,0 +1,208 @@
+name: AppForge Native WebView Build
+
+on:
+  repository_dispatch:
+    types: [appforge-build-native]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BUILD_ID: ${{ github.event.client_payload.build_id }}
+      APP_ID: ${{ github.event.client_payload.app_id }}
+      MANIFEST_URL: ${{ github.event.client_payload.manifest_url }}
+      CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+      SUPABASE_URL: ${{ github.event.client_payload.supabase_url }}
+      SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      UPLOAD_PREFIX: ${{ github.event.client_payload.upload_prefix }}
+
+    steps:
+      - name: Checkout build runner
+        uses: actions/checkout@v4
+
+      - name: Load private callback secret
+        run: |
+          set -euo pipefail
+          CALLBACK_SECRET="$(
+            curl -sSf "$SUPABASE_URL/rest/v1/builds?id=eq.$BUILD_ID&select=callback_secret" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "apikey: $SUPABASE_KEY" \
+              -H "Accept: application/json" \
+            | python3 -c 'import json,sys; rows=json.load(sys.stdin); print(rows[0].get("callback_secret", "") if rows else "")'
+          )"
+          if [ -z "$CALLBACK_SECRET" ]; then
+            echo "Build callback secret is missing" >&2
+            exit 1
+          fi
+          echo "::add-mask::$CALLBACK_SECRET"
+          echo "CALLBACK_SECRET=$CALLBACK_SECRET" >> "$GITHUB_ENV"
+
+      - name: Report running
+        run: |
+          curl -s -X POST "$CALLBACK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Appforge-Secret: $CALLBACK_SECRET" \
+            -d "{\"status\":\"running\",\"logs\":\"Runner started on GitHub Actions. Building native WebView for Android API 36.\",\"gh_run_id\":\"${{ github.run_id }}\"}" || true
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Restore or create stable app signing key
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          SIGNING_ID="${APP_ID:-$BUILD_ID}"
+          KEYSTORE_PREFIX="keystores/$SIGNING_ID"
+          KEYSTORE_OBJECT="$KEYSTORE_PREFIX/android.keystore"
+          PASSWORD_OBJECT="$KEYSTORE_PREFIX/android.keystore.pass"
+
+          set +e
+          curl -sSf "$SUPABASE_URL/storage/v1/object/authenticated/appforge-artifacts/$KEYSTORE_OBJECT" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -o work/android.keystore
+          KS_STATUS=$?
+          set -e
+
+          if [ "$KS_STATUS" -eq 0 ] && [ -s work/android.keystore ]; then
+            echo "Restored existing signing key for $SIGNING_ID"
+            KEYSTORE_PASS="$(
+              curl -sSf "$SUPABASE_URL/storage/v1/object/authenticated/appforge-artifacts/$PASSWORD_OBJECT" \
+                -H "Authorization: Bearer $SUPABASE_KEY" \
+                -H "apikey: $SUPABASE_KEY"
+            )"
+          else
+            echo "No existing signing key found for $SIGNING_ID - creating a new stable one"
+            KEYSTORE_PASS="$(openssl rand -hex 16)"
+            keytool -genkeypair -v \
+              -keystore work/android.keystore \
+              -storepass "$KEYSTORE_PASS" \
+              -keypass "$KEYSTORE_PASS" \
+              -alias android \
+              -keyalg RSA -keysize 2048 -validity 10950 \
+              -dname "CN=AppForge, OU=AppForge, O=AppForge, L=Unknown, ST=Unknown, C=US"
+
+            curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$KEYSTORE_OBJECT" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "apikey: $SUPABASE_KEY" \
+              -H "Content-Type: application/octet-stream" \
+              -H "x-upsert: true" \
+              --data-binary @work/android.keystore > /dev/null
+
+            curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$PASSWORD_OBJECT" \
+              -H "Authorization: Bearer $SUPABASE_KEY" \
+              -H "apikey: $SUPABASE_KEY" \
+              -H "Content-Type: text/plain" \
+              -H "x-upsert: true" \
+              --data-binary "$KEYSTORE_PASS" > /dev/null
+          fi
+
+          echo "::add-mask::$KEYSTORE_PASS"
+          echo "KEYSTORE_PASS=$KEYSTORE_PASS" >> "$GITHUB_ENV"
+
+      - name: Fetch webview config and package name
+        run: |
+          set -euo pipefail
+          curl -sSf "$MANIFEST_URL" -o work/app_config.json
+          PACKAGE_NAME="$(python3 -c 'import json; print(json.load(open("work/app_config.json")).get("packageName") or "com.appforge.generated")')"
+          echo "PACKAGE_NAME=$PACKAGE_NAME" >> "$GITHUB_ENV"
+          cp work/app_config.json webview-template/app/src/main/assets/app_config.json
+
+      - name: Set applicationId
+        working-directory: webview-template
+        run: |
+          set -euo pipefail
+          sed -i "s/com\.appforge\.generated/$PACKAGE_NAME/g" app/build.gradle.kts
+
+      - name: Copy keystore into project
+        run: cp work/android.keystore webview-template/app/release.keystore
+
+      - name: Build signed APK + AAB
+        working-directory: webview-template
+        env:
+          APPFORGE_KEYSTORE_PATH: release.keystore
+          APPFORGE_KEYSTORE_PASSWORD: ${{ env.KEYSTORE_PASS }}
+          APPFORGE_KEY_ALIAS: android
+          APPFORGE_KEY_PASSWORD: ${{ env.KEYSTORE_PASS }}
+        run: gradle assembleRelease bundleRelease --no-daemon
+
+      - name: Verify artifacts and zip source
+        working-directory: webview-template
+        run: |
+          set -euo pipefail
+          APK_PATH="app/build/outputs/apk/release/app-release.apk"
+          AAB_PATH="app/build/outputs/bundle/release/app-release.aab"
+          test -s "$APK_PATH"
+          test -s "$AAB_PATH"
+          echo "apk_path=$APK_PATH" >> "$GITHUB_ENV"
+          echo "aab_path=$AAB_PATH" >> "$GITHUB_ENV"
+
+          zip -rq ../source.zip . -x 'app/build/*' -x '.gradle/*' -x 'app/release.keystore'
+          echo "source_path=source.zip" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        run: |
+          set -euo pipefail
+          APK_SIZE=$(stat -c%s "webview-template/$apk_path")
+          AAB_SIZE=$(stat -c%s "webview-template/$aab_path")
+          SOURCE_SIZE=$(stat -c%s "$source_path")
+
+          APK_KEY="$UPLOAD_PREFIX/app-release.apk"
+          AAB_KEY="$UPLOAD_PREFIX/app-release.aab"
+          SOURCE_KEY="$UPLOAD_PREFIX/source.zip"
+
+          echo "Uploading APK ($APK_SIZE bytes)..."
+          curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$APK_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Content-Type: application/vnd.android.package-archive" \
+            -H "x-upsert: true" \
+            --data-binary @"webview-template/$apk_path" > /dev/null
+
+          echo "Uploading AAB ($AAB_SIZE bytes)..."
+          curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$AAB_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Content-Type: application/octet-stream" \
+            -H "x-upsert: true" \
+            --data-binary @"webview-template/$aab_path" > /dev/null
+
+          echo "Uploading source ($SOURCE_SIZE bytes)..."
+          curl -sSf -X POST "$SUPABASE_URL/storage/v1/object/appforge-artifacts/$SOURCE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_KEY" \
+            -H "apikey: $SUPABASE_KEY" \
+            -H "Content-Type: application/zip" \
+            -H "x-upsert: true" \
+            --data-binary @"$source_path" > /dev/null
+
+          echo "apk_key=$APK_KEY" >> "$GITHUB_ENV"
+          echo "aab_key=$AAB_KEY" >> "$GITHUB_ENV"
+          echo "source_key=$SOURCE_KEY" >> "$GITHUB_ENV"
+          echo "apk_size=$APK_SIZE" >> "$GITHUB_ENV"
+          echo "aab_size=$AAB_SIZE" >> "$GITHUB_ENV"
+          echo "source_size=$SOURCE_SIZE" >> "$GITHUB_ENV"
+
+      - name: Report success
+        if: success()
+        run: |
+          curl -sSf -X POST "$CALLBACK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Appforge-Secret: $CALLBACK_SECRET" \
+            -d "{\"status\":\"success\",\"apk_file\":\"${{ env.apk_key }}\",\"aab_file\":\"${{ env.aab_key }}\",\"source_file\":\"${{ env.source_key }}\",\"apk_size\":${{ env.apk_size }},\"aab_size\":${{ env.aab_size }},\"source_size\":${{ env.source_size }},\"gh_run_id\":\"${{ github.run_id }}\"}"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          curl -s -X POST "$CALLBACK_URL" \
+            -H 'Content-Type: application/json' \
+            -H "X-Appforge-Secret: $CALLBACK_SECRET" \
+            -d "{\"status\":\"failed\",\"logs\":\"Native build failed - check GitHub Actions run ${{ github.run_id }} for details.\",\"gh_run_id\":\"${{ github.run_id }}\"}" || true
