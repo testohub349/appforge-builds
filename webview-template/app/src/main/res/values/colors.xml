@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+      <color name="appforge_primary">#1F5FB0</color>
+      <color name="appforge_primary_dark">#153F78</color>
+      <color name="appforge_accent">#FDECC8</color>
+</resources>
